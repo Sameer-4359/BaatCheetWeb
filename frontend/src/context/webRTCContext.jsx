@@ -1,105 +1,103 @@
-// import React, { createContext, useContext, useState } from 'react';
-
-// const WebRTCContext = createContext();
-
-// export const WebRTCProvider = ({ children }) => {
-//   const [localStream, setLocalStream] = useState(null);
-//   const [remoteStream, setRemoteStream] = useState(null);
-//   const [callStatus, setCallStatus] = useState('idle');
-//   const [activeCall, setActiveCall] = useState(null);
-//   const [chatMessages, setChatMessages] = useState([]);
-
-//   const startCall = () => console.log('Start call placeholder');
-//   const answerCall = () => console.log('Answer call placeholder');
-//   const endCall = () => console.log('End call placeholder');
-//   const sendChatMessage = () => console.log('Send message placeholder');
-
-//   const value = {
-//     localStream,
-//     remoteStream,
-//     callStatus,
-//     activeCall,
-//     chatMessages,
-//     startCall,
-//     answerCall,
-//     endCall,
-//     sendChatMessage
-//   };
-
-//   return (
-//     <WebRTCContext.Provider value={value}>
-//       {children}
-//     </WebRTCContext.Provider>
-//   );
-// };
-
-// export const useWebRTC = () => {
-//   const context = useContext(WebRTCContext);
-//   if (!context) {
-//     throw new Error('useWebRTC must be used within a WebRTCProvider');
-//   }
-//   return context;
-// };
-
-
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { useAuth } from './AuthContext';
 
 const WebRTCContext = createContext();
 
 export const WebRTCProvider = ({ children }) => {
-  const { user } = useAuth();
+  const { user, token } = useAuth();
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
   const [callStatus, setCallStatus] = useState('idle'); // 'idle', 'calling', 'incoming', 'ongoing'
   const [activeCall, setActiveCall] = useState(null);
   const [chatMessages, setChatMessages] = useState([]);
   const [onlineUsers, setOnlineUsers] = useState([]);
+  const [connectionError, setConnectionError] = useState(null);
+  
   const ws = useRef(null);
   const pc = useRef(null);
+  const connectionCheckTimer = useRef(null);
 
   // Initialize WebSocket connection
   useEffect(() => {
-    if (!user) return;
+    if (!user || !token) return;
 
-    const token = localStorage.getItem('token');
-    ws.current = new WebSocket(`ws://localhost:5000?token=${token}`);
+    // Close any existing connection
+    if (ws.current) {
+      ws.current.close();
+    }
+
+    // Create new WebSocket connection
+    const socketUrl = `ws://localhost:5000?token=${token}`;
+    ws.current = new WebSocket(socketUrl);
 
     ws.current.onopen = () => {
-      console.log('WebSocket connected');
+      console.log('WebSocket connected successfully');
+      setConnectionError(null);
     };
 
     ws.current.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        console.log('WebSocket message received:', data.type);
         handleWebSocketMessage(data);
       } catch (error) {
         console.error('Error parsing WebSocket message:', error);
       }
     };
 
-    ws.current.onclose = () => {
-      console.log('WebSocket disconnected');
+    ws.current.onclose = (event) => {
+      console.log('WebSocket disconnected:', event.code, event.reason);
+      setConnectionError('WebSocket connection closed. Please refresh the page.');
     };
 
     ws.current.onerror = (error) => {
       console.error('WebSocket error:', error);
+      setConnectionError('WebSocket connection error. Please check your network connection.');
     };
 
+    // Clean up function
     return () => {
+      if (connectionCheckTimer.current) {
+        clearInterval(connectionCheckTimer.current);
+      }
       if (ws.current) {
         ws.current.close();
       }
-      endCall(); // Clean up any ongoing call
+      closeMediaAndResetCall();
     };
-  }, [user]);
+  }, [user, token]);
+
+  // Setup ping interval to keep connection alive
+  useEffect(() => {
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      connectionCheckTimer.current = setInterval(() => {
+        try {
+          ws.current.send(JSON.stringify({ type: 'ping' }));
+        } catch (error) {
+          console.error('Error sending ping:', error);
+        }
+      }, 30000); // 30 seconds
+    }
+
+    return () => {
+      if (connectionCheckTimer.current) {
+        clearInterval(connectionCheckTimer.current);
+      }
+    };
+  }, [ws.current]);
 
   const handleWebSocketMessage = (data) => {
     switch (data.type) {
+      case 'online-users':
+        console.log('Online users updated:', data.users);
+        setOnlineUsers(data.users);
+        break;
       case 'offer':
+        console.log('Received call offer from:', data.callerId);
         handleIncomingCall(data);
         break;
       case 'answer':
+        console.log('Received call answer');
         handleAnswer(data);
         break;
       case 'candidate':
@@ -108,26 +106,39 @@ export const WebRTCProvider = ({ children }) => {
       case 'chat':
         handleIncomingChat(data);
         break;
-      case 'online-users':
-        setOnlineUsers(data.users);
-        break;
       case 'end-call':
         handleRemoteEndCall();
         break;
       case 'busy':
         handleBusySignal();
         break;
+      case 'pong':
+        // Silent handling of pong responses
+        break;
       default:
         console.log('Unknown message type:', data.type);
     }
   };
 
-  const startCall = async (recipientId) => {
-    if (callStatus !== 'idle') return;
+  const startCall = async (recipientId, recipientName) => {
+    if (callStatus !== 'idle') {
+      console.log('Cannot start call: call status is', callStatus);
+      return;
+    }
+
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+      setConnectionError('WebSocket not connected. Please refresh the page.');
+      return;
+    }
 
     try {
+      console.log(`Starting call to user ${recipientId} (${recipientName})`);
       setCallStatus('calling');
-      setActiveCall({ recipientId, initiator: true });
+      setActiveCall({ 
+        recipientId, 
+        recipientName, 
+        initiator: true 
+      });
       
       // Get user media
       const stream = await navigator.mediaDevices.getUserMedia({ 
@@ -137,18 +148,9 @@ export const WebRTCProvider = ({ children }) => {
       setLocalStream(stream);
       
       // Create peer connection
-      pc.current = new RTCPeerConnection({
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          // Add TURN servers here if needed
-        ]
-      });
+      pc.current = createPeerConnection();
 
-      // Set up event handlers
-      pc.current.onicecandidate = handleICECandidate;
-      pc.current.ontrack = handleTrack;
-      
-      // Add local stream tracks
+      // Add local stream tracks to peer connection
       stream.getTracks().forEach(track => {
         pc.current.addTrack(track, stream);
       });
@@ -159,16 +161,40 @@ export const WebRTCProvider = ({ children }) => {
       
       ws.current.send(JSON.stringify({
         type: 'offer',
-        sdp: offer.sdp,
+        sdp: pc.current.localDescription.sdp,
         recipientId,
-        callerId: user.id,
         callerName: user.name
       }));
       
     } catch (error) {
       console.error('Error starting call:', error);
+      alert('Failed to start call: ' + error.message);
       endCall();
     }
+  };
+
+  const createPeerConnection = () => {
+    const peerConnection = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' }
+        // Add TURN servers here if needed for production
+      ]
+    });
+
+    peerConnection.onicecandidate = handleICECandidate;
+    peerConnection.ontrack = handleTrack;
+    peerConnection.oniceconnectionstatechange = () => {
+      console.log('ICE connection state:', peerConnection.iceConnectionState);
+      if (peerConnection.iceConnectionState === 'failed' || 
+          peerConnection.iceConnectionState === 'disconnected') {
+        console.warn('ICE connection failed or disconnected');
+        // Could implement reconnection logic here
+      }
+    };
+
+    return peerConnection;
   };
 
   const handleIncomingCall = async (data) => {
@@ -181,6 +207,7 @@ export const WebRTCProvider = ({ children }) => {
       return;
     }
 
+    console.log('Handling incoming call from', data.callerName);
     setCallStatus('incoming');
     setActiveCall({
       callerId: data.callerId,
@@ -188,27 +215,29 @@ export const WebRTCProvider = ({ children }) => {
       initiator: false
     });
 
-    // Create peer connection for incoming call
-    pc.current = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' }
-      ]
-    });
+    try {
+      // Create peer connection for incoming call
+      pc.current = createPeerConnection();
 
-    pc.current.onicecandidate = handleICECandidate;
-    pc.current.ontrack = handleTrack;
-
-    // Set remote description from offer
-    await pc.current.setRemoteDescription(new RTCSessionDescription({
-      type: 'offer',
-      sdp: data.sdp
-    }));
+      // Set remote description from offer
+      await pc.current.setRemoteDescription(new RTCSessionDescription({
+        type: 'offer',
+        sdp: data.sdp
+      }));
+    } catch (error) {
+      console.error('Error handling incoming call:', error);
+      endCall();
+    }
   };
 
   const answerCall = async () => {
-    if (callStatus !== 'incoming' || !pc.current) return;
+    if (callStatus !== 'incoming' || !pc.current) {
+      console.log('Cannot answer call: invalid state');
+      return;
+    }
 
     try {
+      console.log('Answering call');
       // Get user media
       const stream = await navigator.mediaDevices.getUserMedia({ 
         video: true, 
@@ -227,18 +256,20 @@ export const WebRTCProvider = ({ children }) => {
 
       ws.current.send(JSON.stringify({
         type: 'answer',
-        sdp: answer.sdp,
+        sdp: pc.current.localDescription.sdp,
         recipientId: activeCall.callerId
       }));
 
       setCallStatus('ongoing');
     } catch (error) {
       console.error('Error answering call:', error);
+      alert('Failed to answer call: ' + error.message);
       endCall();
     }
   };
 
-  const endCall = () => {
+  const closeMediaAndResetCall = () => {
+    // Close peer connection if it exists
     if (pc.current) {
       pc.current.close();
       pc.current = null;
@@ -251,71 +282,103 @@ export const WebRTCProvider = ({ children }) => {
     }
     
     setRemoteStream(null);
+    setChatMessages([]);
     setCallStatus('idle');
-    
-    // Notify other participant if call was active
-    if (activeCall && (callStatus === 'ongoing' || callStatus === 'calling')) {
-      ws.current.send(JSON.stringify({
-        type: 'end-call',
-        recipientId: activeCall.initiator ? activeCall.recipientId : activeCall.callerId
-      }));
-    }
-    
     setActiveCall(null);
   };
 
+  const endCall = () => {
+    console.log('Ending call');
+    
+    // Notify other participant if call was active
+    if (activeCall && ws.current && ws.current.readyState === WebSocket.OPEN) {
+      const recipientId = activeCall.initiator ? 
+        activeCall.recipientId : activeCall.callerId;
+      
+      ws.current.send(JSON.stringify({
+        type: 'end-call',
+        recipientId
+      }));
+    }
+    
+    closeMediaAndResetCall();
+  };
+
   const handleRemoteEndCall = () => {
-    if (callStatus === 'ongoing') {
+    console.log('Remote participant ended the call');
+    if (callStatus === 'ongoing' || callStatus === 'calling') {
       alert('The other participant has ended the call');
     }
-    endCall();
+    closeMediaAndResetCall();
   };
 
   const handleBusySignal = () => {
+    console.log('Received busy signal');
     if (callStatus === 'calling') {
       alert('The user is busy in another call');
-      endCall();
+      closeMediaAndResetCall();
     }
   };
 
   const handleAnswer = async (data) => {
-    if (!pc.current || callStatus !== 'calling') return;
+    if (!pc.current || callStatus !== 'calling') {
+      console.log('Cannot handle answer: invalid state');
+      return;
+    }
     
-    await pc.current.setRemoteDescription(new RTCSessionDescription({
-      type: 'answer',
-      sdp: data.sdp
-    }));
-    setCallStatus('ongoing');
+    try {
+      console.log('Handling call answer');
+      await pc.current.setRemoteDescription(new RTCSessionDescription({
+        type: 'answer',
+        sdp: data.sdp
+      }));
+      setCallStatus('ongoing');
+    } catch (error) {
+      console.error('Error handling answer:', error);
+      endCall();
+    }
   };
 
   const handleCandidate = (data) => {
     if (pc.current && data.candidate) {
-      pc.current.addIceCandidate(new RTCIceCandidate(data.candidate));
+      try {
+        pc.current.addIceCandidate(new RTCIceCandidate(data.candidate))
+          .catch(e => console.error('Error adding ICE candidate:', e));
+      } catch (error) {
+        console.error('Error handling ICE candidate:', error);
+      }
     }
   };
 
   const handleTrack = (event) => {
+    console.log('Remote track received', event);
     if (event.streams && event.streams[0]) {
+      console.log('Setting remote stream');
       setRemoteStream(event.streams[0]);
     }
   };
 
   const handleICECandidate = (event) => {
-    if (event.candidate && activeCall) {
+    if (event.candidate && activeCall && ws.current) {
+      const recipientId = activeCall.initiator ? 
+        activeCall.recipientId : activeCall.callerId;
+      
       ws.current.send(JSON.stringify({
         type: 'candidate',
         candidate: event.candidate,
-        recipientId: activeCall.initiator ? activeCall.recipientId : activeCall.callerId
+        recipientId
       }));
     }
   };
 
   const sendChatMessage = (messageText) => {
-    if (!activeCall || !ws.current) return;
+    if (!activeCall || !ws.current || ws.current.readyState !== WebSocket.OPEN) {
+      console.log('Cannot send message: no active call or WebSocket');
+      return;
+    }
     
-    const recipientId = activeCall.initiator 
-      ? activeCall.recipientId 
-      : activeCall.callerId;
+    const recipientId = activeCall.initiator ? 
+      activeCall.recipientId : activeCall.callerId;
     
     const message = {
       type: 'chat',
@@ -327,10 +390,13 @@ export const WebRTCProvider = ({ children }) => {
     };
     
     ws.current.send(JSON.stringify(message));
+    
+    // Add message to local chat history
     setChatMessages(prev => [...prev, message]);
   };
 
   const handleIncomingChat = (data) => {
+    console.log('Received chat message:', data);
     setChatMessages(prev => [...prev, data]);
   };
 
@@ -341,6 +407,7 @@ export const WebRTCProvider = ({ children }) => {
     activeCall,
     chatMessages,
     onlineUsers,
+    connectionError,
     startCall,
     answerCall,
     endCall,

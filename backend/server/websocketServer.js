@@ -1,21 +1,46 @@
 const WebSocket = require('ws');
 const jwt = require('jsonwebtoken');
+const User = require('../models/UserModel');
 
 const setupWebSocketServer = (server) => {
   const wss = new WebSocket.Server({ server });
-  const clients = new Map();
+  const clients = new Map(); // Map<userId, {ws, userData}>
 
-  wss.on('connection', (ws, req) => {
-    const token = req.url.split('token=')[1];
-    
+  wss.on('connection', async (ws, req) => {
+    let token;
     try {
+      // Extract token from URL
+      const url = new URL(req.url, 'http://localhost');
+      token = url.searchParams.get('token');
+      
+      if (!token) {
+        ws.close(1008, 'Token missing');
+        return;
+      }
+      
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       const userId = decoded.id;
       
-      clients.set(userId, ws);
-      console.log(`User connected: ${userId}`);
+      // Get user data from database to include name
+      const user = await User.findById(userId).select('name email');
+      if (!user) {
+        ws.close(1008, 'User not found');
+        return;
+      }
+      
+      // Store both websocket and user data
+      clients.set(userId, { 
+        ws,
+        userData: {
+          id: userId,
+          name: user.name,
+          email: user.email
+        }
+      });
+      
+      console.log(`User connected: ${userId} (${user.name})`);
 
-      // Notify all clients about new connection
+      // Notify all clients about online users
       broadcastOnlineUsers();
 
       ws.on('message', (message) => {
@@ -34,7 +59,8 @@ const setupWebSocketServer = (server) => {
       });
 
     } catch (error) {
-      ws.close(1008, 'Invalid token');
+      console.error('WebSocket connection error:', error);
+      ws.close(1008, 'Invalid token or server error');
     }
   });
 
@@ -64,21 +90,22 @@ const setupWebSocketServer = (server) => {
   };
 
   const handleOffer = (senderId, data) => {
-    const recipientWs = clients.get(data.recipientId);
-    if (recipientWs) {
-      recipientWs.send(JSON.stringify({
+    const recipientClient = clients.get(data.recipientId);
+    if (recipientClient) {
+      const senderData = clients.get(senderId)?.userData;
+      recipientClient.ws.send(JSON.stringify({
         type: 'offer',
         sdp: data.sdp,
         callerId: senderId,
-        callerName: data.callerName
+        callerName: senderData?.name || 'Unknown User'
       }));
     }
   };
 
   const handleAnswer = (senderId, data) => {
-    const recipientWs = clients.get(data.recipientId);
-    if (recipientWs) {
-      recipientWs.send(JSON.stringify({
+    const recipientClient = clients.get(data.recipientId);
+    if (recipientClient) {
+      recipientClient.ws.send(JSON.stringify({
         type: 'answer',
         sdp: data.sdp,
         answererId: senderId
@@ -87,9 +114,9 @@ const setupWebSocketServer = (server) => {
   };
 
   const handleCandidate = (senderId, data) => {
-    const recipientWs = clients.get(data.recipientId);
-    if (recipientWs) {
-      recipientWs.send(JSON.stringify({
+    const recipientClient = clients.get(data.recipientId);
+    if (recipientClient) {
+      recipientClient.ws.send(JSON.stringify({
         type: 'candidate',
         candidate: data.candidate,
         senderId
@@ -98,9 +125,9 @@ const setupWebSocketServer = (server) => {
   };
 
   const handleEndCall = (senderId, data) => {
-    const recipientWs = clients.get(data.recipientId);
-    if (recipientWs) {
-      recipientWs.send(JSON.stringify({
+    const recipientClient = clients.get(data.recipientId);
+    if (recipientClient) {
+      recipientClient.ws.send(JSON.stringify({
         type: 'end-call',
         senderId
       }));
@@ -108,19 +135,21 @@ const setupWebSocketServer = (server) => {
   };
 
   const handleChat = (senderId, data) => {
-    const recipientWs = clients.get(data.recipientId);
-    if (recipientWs) {
-      recipientWs.send(JSON.stringify({
+    const recipientClient = clients.get(data.recipientId);
+    if (recipientClient) {
+      const senderData = clients.get(senderId)?.userData;
+      recipientClient.ws.send(JSON.stringify({
         ...data,
-        senderId
+        senderId,
+        senderName: senderData?.name || 'Unknown User'
       }));
     }
   };
 
   const handleBusy = (senderId, data) => {
-    const recipientWs = clients.get(data.recipientId);
-    if (recipientWs) {
-      recipientWs.send(JSON.stringify({
+    const recipientClient = clients.get(data.recipientId);
+    if (recipientClient) {
+      recipientClient.ws.send(JSON.stringify({
         type: 'busy',
         senderId
       }));
@@ -128,11 +157,18 @@ const setupWebSocketServer = (server) => {
   };
 
   const broadcastOnlineUsers = () => {
-    const onlineUsers = Array.from(clients.keys());
-    clients.forEach((ws, userId) => {
+    // Prepare a list of online users with their data
+    const onlineUsersArray = Array.from(clients.entries()).map(([userId, {userData}]) => ({
+      id: userId,
+      name: userData.name
+    }));
+
+    // Send the list to all connected clients
+    clients.forEach(({ws}, userId) => {
+      const otherUsers = onlineUsersArray.filter(user => user.id !== userId);
       ws.send(JSON.stringify({
         type: 'online-users',
-        users: onlineUsers.filter(id => id !== userId)
+        users: otherUsers
       }));
     });
   };
